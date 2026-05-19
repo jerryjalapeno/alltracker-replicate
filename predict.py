@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import cv2
@@ -188,6 +189,38 @@ def colors_cluster(trajs: np.ndarray, k: int = 8) -> np.ndarray:
 
 
 # ---------- Rendering ----------
+
+def batched_flow2color(flow: torch.Tensor) -> np.ndarray:
+    """Batched HSV-encoded optical flow viz. flow: (T,2,H,W) on CUDA. Returns (T,H,W,3) uint8.
+    Uses a single global clip across all frames so colors are stable through the clip.
+    """
+    with torch.no_grad():
+        T, _, H, W = flow.shape
+        clip = flow.abs().max().clamp(min=1e-6)
+        f = (flow / clip).clamp(-1, 1)
+        radius = torch.sqrt(f[:, 0] ** 2 + f[:, 1] ** 2).clamp(0, 1)        # (T,H,W) value
+        angle = torch.atan2(-f[:, 1], -f[:, 0]) / np.pi                     # (T,H,W) -1..1
+        h = ((angle + 1.0) / 2.0).clamp(0, 1)                                # 0..1
+        s = torch.full_like(h, 0.75)
+        v = radius
+        # HSV→RGB (numpy/matplotlib algorithm), fully vectorized
+        i = (h * 6.0).floor()
+        frac = h * 6.0 - i
+        i = i.long() % 6
+        p = v * (1.0 - s)
+        q = v * (1.0 - frac * s)
+        t = v * (1.0 - (1.0 - frac) * s)
+        # build per-sextant RGB by gather
+        # cases: 0:(v,t,p) 1:(q,v,p) 2:(p,v,t) 3:(p,q,v) 4:(t,p,v) 5:(v,p,q)
+        r = torch.where(i == 0, v, torch.where(i == 1, q, torch.where(i == 2, p,
+            torch.where(i == 3, p, torch.where(i == 4, t, v)))))
+        g = torch.where(i == 0, t, torch.where(i == 1, v, torch.where(i == 2, v,
+            torch.where(i == 3, q, torch.where(i == 4, p, p)))))
+        b = torch.where(i == 0, p, torch.where(i == 1, p, torch.where(i == 2, t,
+            torch.where(i == 3, v, torch.where(i == 4, v, q)))))
+        rgb = torch.stack([r, g, b], dim=-1) * 255.0   # (T,H,W,3)
+        return rgb.clamp(0, 255).byte().cpu().numpy()
+
 
 def render_dots_gpu(
     rgbs: torch.Tensor,           # (T,3,H,W) float 0..255 on CUDA
@@ -442,8 +475,8 @@ class Predictor(BasePredictor):
             default=0.1, ge=0.0, le=1.0,
         ),
         output_format: str = Input(
-            description="What to return.",
-            choices=["mp4_overlay", "mp4_sidebyside", "trajectories_json", "trajectories_npz", "all"],
+            description="What to return. 'flow_video' is HSV-encoded optical-flow visualization; 'flow_npz' is the raw dense flow tensor (T,2,H,W) at model resolution.",
+            choices=["mp4_overlay", "mp4_sidebyside", "mp4_flow", "trajectories_json", "trajectories_npz", "flow_npz", "all"],
             default="all",
         ),
         overlay_style: str = Input(
@@ -634,7 +667,29 @@ class Predictor(BasePredictor):
         want_overlay = output_format in ("mp4_overlay", "mp4_sidebyside", "all")
         want_json = output_format in ("trajectories_json", "all")
         want_npz = output_format in ("trajectories_npz", "all")
+        want_flow_video = output_format in ("mp4_flow", "all")
+        want_flow_npz = output_format in ("flow_npz", "all")
 
+        # Guardrail: trajectories.json is O(N*T) chars and json.dump is single-threaded.
+        # Auto-skip when the user implicitly requested 'all' but N*T is huge.
+        N_T = N * T
+        JSON_LIMIT = 5_000_000
+        if want_json and output_format == "all" and N_T > JSON_LIMIT:
+            print(f"[alltracker] skipping trajectories_json (N*T={N_T:,} > {JSON_LIMIT:,}); NPZ still written")
+            want_json = False
+
+        # Prepare per-output payloads (CPU-side work shared across outputs)
+        traj_orig = None
+        q_points_orig = None
+        if want_json or want_npz:
+            traj_orig = trajs_np.copy()
+            traj_orig[..., 0] /= scale_x
+            traj_orig[..., 1] /= scale_y
+            q_points_orig = q_points.copy()
+            q_points_orig[:, 0] /= scale_x
+            q_points_orig[:, 1] /= scale_y
+
+        # ---- Render overlay video (GPU/CPU, frame buffer in numpy) ----
         if want_overlay:
             if overlay_style == "dots":
                 trajs_gpu = torch.from_numpy(trajs_np).float().cuda()
@@ -651,66 +706,88 @@ class Predictor(BasePredictor):
                     point_size=point_size, background=background,
                 )
             if output_format == "mp4_sidebyside":
-                orig = rgbs_t[0].byte().permute(0, 2, 3, 1).cpu().numpy()
-                composite = np.concatenate([orig, frames_drawn], axis=2)
-                video_out = tmpdir / "overlay.mp4"
-                write_video_ffmpeg(composite, out_fps, str(video_out), output_codec)
-            else:
-                video_out = tmpdir / "overlay.mp4"
-                write_video_ffmpeg(frames_drawn, out_fps, str(video_out), output_codec)
-            outputs["video"] = Path(video_out)
+                orig_np = rgbs_t[0].byte().permute(0, 2, 3, 1).cpu().numpy()
+                frames_drawn = np.concatenate([orig_np, frames_drawn], axis=2)
 
-        if want_json:
-            traj_orig = trajs_np.copy()
-            traj_orig[..., 0] /= scale_x
-            traj_orig[..., 1] /= scale_y
-            q_points_orig = q_points.copy()
-            q_points_orig[:, 0] /= scale_x
-            q_points_orig[:, 1] /= scale_y
-            payload = {
-                "frames": int(T),
-                "points": int(N),
-                "fps": float(eff_fps),
-                "query_frame": int(qf),
-                "query_points": q_points_orig.tolist(),
-                "tracks": traj_orig.tolist(),
-                "visibility": vis_score.tolist(),
-            }
-            json_out = tmpdir / "trajectories.json"
-            with open(json_out, "w") as f:
-                json.dump(payload, f)
-            if want_npz and output_format == "all":
-                # produce npz too
-                npz_out = tmpdir / "trajectories.npz"
-                np.savez_compressed(
-                    npz_out,
-                    tracks=traj_orig.astype(np.float32),
-                    visibility=vis_score.astype(np.float32),
-                    query_points=q_points_orig.astype(np.float32),
-                    query_frame=np.int32(qf),
-                    fps=np.float32(eff_fps),
-                )
-                outputs["trajectories"] = Path(json_out)
-                outputs["trajectories_npz"] = Path(npz_out)
-            else:
-                outputs["trajectories"] = Path(json_out)
-        elif want_npz:
-            traj_orig = trajs_np.copy()
-            traj_orig[..., 0] /= scale_x
-            traj_orig[..., 1] /= scale_y
-            q_points_orig = q_points.copy()
-            q_points_orig[:, 0] /= scale_x
-            q_points_orig[:, 1] /= scale_y
-            npz_out = tmpdir / "trajectories.npz"
-            np.savez_compressed(
-                npz_out,
+        # ---- Pre-compute flow tensors on GPU once for both flow outputs ----
+        flow_orig_np = None
+        flow_vis_np = None
+        flow_rgb_frames = None
+        if want_flow_npz or want_flow_video:
+            with torch.no_grad():
+                flow_model = (traj_maps_full[0] - grid_xy[0])              # (T,2,H,W) model-pixel
+                if want_flow_video:
+                    flow_rgb_frames = batched_flow2color(flow_model)        # (T,H,W,3) uint8
+                if want_flow_npz:
+                    flow_orig_x = flow_model[:, 0:1] / scale_x
+                    flow_orig_y = flow_model[:, 1:2] / scale_y
+                    flow_orig = torch.cat([flow_orig_x, flow_orig_y], dim=1)
+                    flow_orig_np = flow_orig.cpu().numpy().astype(np.float32)
+                    flow_vis_np = visconf_maps_full[0, :, 1].cpu().numpy().astype(np.float32)
+
+        # ---- Parallel disk writes ----
+        # Each task does file I/O (json.dump, np.savez, ffmpeg pipe) — overlapping
+        # them with threads saves wall-clock time since they release the GIL during I/O.
+        def _write_json():
+            p = tmpdir / "trajectories.json"
+            with open(p, "w") as f:
+                json.dump({
+                    "frames": int(T), "points": int(N), "fps": float(eff_fps),
+                    "query_frame": int(qf),
+                    "query_points": q_points_orig.tolist(),
+                    "tracks": traj_orig.tolist(),
+                    "visibility": vis_score.tolist(),
+                }, f)
+            return ("trajectories", Path(p))
+
+        def _write_traj_npz():
+            p = tmpdir / "trajectories.npz"
+            np.savez_compressed(  # tracks are sparse + smooth → compression wins big
+                p,
                 tracks=traj_orig.astype(np.float32),
                 visibility=vis_score.astype(np.float32),
                 query_points=q_points_orig.astype(np.float32),
                 query_frame=np.int32(qf),
                 fps=np.float32(eff_fps),
             )
-            outputs["trajectories"] = Path(npz_out)
+            return ("trajectories_npz", Path(p))
+
+        def _write_flow_npz():
+            p = tmpdir / "flow.npz"
+            np.savez(           # uncompressed: dense per-pixel flow is too varied for zlib to help much
+                p,
+                flow=flow_orig_np,                  # (T,2,H,W) original-pixel displacement
+                visibility=flow_vis_np,             # (T,H,W)
+                query_frame=np.int32(qf),
+                model_resolution=np.int32([H, W]),
+                fps=np.float32(eff_fps),
+            )
+            return ("flow_npz", Path(p))
+
+        def _write_overlay_mp4():
+            p = tmpdir / "overlay.mp4"
+            write_video_ffmpeg(frames_drawn, out_fps, str(p), output_codec)
+            return ("video", Path(p))
+
+        def _write_flow_mp4():
+            p = tmpdir / "flow.mp4"
+            write_video_ffmpeg(flow_rgb_frames, out_fps, str(p), output_codec)
+            return ("flow_video", Path(p))
+
+        jobs = []
+        if want_overlay:    jobs.append(_write_overlay_mp4)
+        if want_flow_video: jobs.append(_write_flow_mp4)
+        if want_json:       jobs.append(_write_json)
+        if want_npz:        jobs.append(_write_traj_npz)
+        if want_flow_npz:   jobs.append(_write_flow_npz)
+
+        if jobs:
+            t_w = time.time()
+            with ThreadPoolExecutor(max_workers=min(5, len(jobs))) as ex:
+                for fut in [ex.submit(j) for j in jobs]:
+                    key, path = fut.result()
+                    outputs[key] = path
+            print(f"[alltracker] output writes: {time.time()-t_w:.2f}s ({len(jobs)} files)")
 
         runtime = time.time() - t_start
         outputs["stats"] = {

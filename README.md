@@ -1,162 +1,356 @@
-# AllTracker: Efficient Dense Point Tracking at High Resolution
+# AllTracker on Replicate
 
-**[[Paper](https://arxiv.org/abs/2506.07310)] [[Project Page](https://alltracker.github.io/)] [[Gradio Demo](https://huggingface.co/spaces/aharley/alltracker)]**
+A flexible [Cog](https://github.com/replicate/cog) wrapper around [AllTracker](https://github.com/aharley/alltracker) (Harley et al., ICCV 2025) for dense long-range point tracking.
 
-<img src='https://alltracker.github.io/images/monkey.jpg'>
+> Upstream model docs (training, dataset prep, paper details) live in [`README_UPSTREAM.md`](README_UPSTREAM.md). This README covers the Replicate packaging and runtime usage.
 
-**AllTracker is a point tracking model which is faster and more accurate than other similar models, while also producing dense output at high resolution.**
+**Model:** https://replicate.com/jerryjalapeno/alltracker
+**Hardware:** Nvidia A100 80 GB
+**Inference cost on the zombie test clip (8s, 1080p, 192 frames):** ~6s GPU time at 768px / 83k points.
 
-AllTracker estimates long-range point tracks by way of estimating the flow field between a query frame and every other frame of a video. Unlike existing point tracking methods, our approach delivers high-resolution and dense (all-pixel) correspondence fields, which can be visualized as flow maps. Unlike existing optical flow methods, our approach corresponds one frame to hundreds of subsequent frames, rather than just the next frame.
+---
 
-We are actively adding to this repo, but please ping or open an issue if you notice something missing or broken. The demo (at least) should work for everyone!
+## Quick start
 
+### Web UI
 
-## Env setup
+1. Open https://replicate.com/jerryjalapeno/alltracker
+2. Upload a video, leave the defaults, hit **Run**.
+3. You'll get back an MP4 overlay, a trajectories JSON, an NPZ, a preview frame, and a stats dict.
 
-Install miniconda:
-```
-mkdir -p ~/miniconda3
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
-bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
-rm ~/miniconda3/miniconda.sh
-source ~/miniconda3/bin/activate
-conda init
-```
+### Python
 
-Set up a fresh conda environment for AllTracker:
+```python
+import replicate, os
+os.environ["REPLICATE_API_TOKEN"] = "r8_…"
 
-```
-conda create -n alltracker python=3.12.8
-conda activate alltracker
-pip install -r requirements.txt
-```
-
-## Running the demo
-
-Download the sample video:
-```
-cd demo_video
-sh download_video.sh
-cd ..
-```
-
-Run the demo:
-```
-python demo.py --mp4_path ./demo_video/monkey.mp4
-```
-The demo script will automatically download the model weights from [huggingface](https://huggingface.co/aharley/alltracker/tree/main) if needed.
-
-For a fancier visualization, giving a side-by-side view of the input and output, try this:
-```
-python demo.py --mp4_path ./demo_video/monkey.mp4 --query_frame 32 --conf_thr 0.01 --bkg_opacity 0.0 --rate 2 --hstack --query_frame 16
+out = replicate.run(
+    "jerryjalapeno/alltracker",  # uses latest version
+    input={
+        "video": open("clip.mp4", "rb"),
+        "max_frames": 192,
+        "resize_to": 768,
+        "query_mode": "dense",
+        "dense_stride": 2,
+        "overlay_style": "dots",
+        "background": "dim",
+        "output_format": "mp4_overlay",
+    },
+)
+print(out["video"])  # https://replicate.delivery/.../overlay.mp4
 ```
 
+### curl
 
-
-
-## Training
-
-AllTracker is trained in two stages: Stage 1 is kubric alone; Stage 2 is a mix of datasets. This 2-stage regime enables fair comparisons with models that train only on Kubric. 
-
-### Data prep
-
-Start by downloding Kubric. 
-
-- 24-frame data: [kubric_au.tar.gz](https://huggingface.co/datasets/aharley/alltracker_data/resolve/main/kubric_au.tar.gz?download=true)
-
-- 64-frame data: [part1](https://huggingface.co/datasets/aharley/alltracker_data/resolve/main/ce64_kub_aa?download=true), [part2](https://huggingface.co/datasets/aharley/alltracker_data/resolve/main/ce64_kub_ab?download=true), [part3](https://huggingface.co/datasets/aharley/alltracker_data/resolve/main/ce64_kub_ac?download=true)
-
-Merge the parts by concatenating:
-```
-cat ce64_kub_aa ce64_kub_ab ce64_kub_ac > ce64_kub.tar.gz
+```bash
+curl -s -X POST https://api.replicate.com/v1/predictions \
+  -H "Authorization: Bearer $REPLICATE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "63bead4682f97e370f62c14726456959bb8f193ab0b9dddeb3875ca6ad139c6e",
+    "input": {
+      "video": "https://example.com/clip.mp4",
+      "query_mode": "grid",
+      "grid_size": 60,
+      "resize_to": 768
+    }
+  }'
 ```
 
-The 24-frame Kubric data is a torch export of the official `kubric-public/tfds/movi_f/512x512` data.
+---
 
-With Kubric, you can skip the other datasets and start training Stage 1.
+## Inputs
 
-Download the rest of the point tracking datasets from [here](https://huggingface.co/datasets/aharley/alltracker_data/tree/main). There you will find 24-frame datasets, `ce24*.tar.gz`, and 64-frame datasets, `ce64*.tar.gz`. Some of the datasets are large, and they are split into parts, so you need to create the full files by concatenating. 
+### Video & sampling
 
-On disk, the point tracking datasets should look like this:
-```
-data/
-├── ce24/
-│   ├── drivingpt/
-│   ├── fltpt/
-│   ├── monkapt/
-│   ├── springpt/
-├── ce64/
-│   ├── drivingpt/
-│   ├── kublong/
-│   ├── monkapt/
-│   ├── podlong/
-│   ├── springpt/
-├── dynamicreplica/
-├── kubric_au/
-```
+| Input | Type | Default | Notes |
+|---|---|---|---|
+| `video` | File | **required** | MP4/MOV/WebM/GIF. URL or upload. |
+| `fps` | int | 0 | Resample to N fps before tracking. 0 = keep source. |
+| `max_frames` | int | 256 | Hard cap on processed frames (memory guardrail). Up to 2000. |
+| `start_frame` | int | 0 | Trim: first frame to include. |
+| `end_frame` | int | -1 | Trim: last frame (-1 = end of video). |
+| `resize_to` | int | 512 | Long-edge resize before tracking. Rounded to multiple of 8. **0 = native**, max 2048. Bigger = denser pixel lattice and finer flow. |
 
-Download the optical flow datasets from the official websites: [FlyingChairs, FlyingThings3D, Monkaa, Driving](https://lmb.informatik.uni-freiburg.de/resources/datasets) [AutoFlow](https://autoflow-google.github.io/), [SPRING](https://spring-benchmark.org/), [VIPER](https://playing-for-benchmarks.org/download/), [HD1K](http://hci-benchmark.iwr.uni-heidelberg.de/), [KITTI](https://www.cvlibs.net/datasets/kitti/eval_scene_flow.php?benchmark=flow), [TARTANAIR](https://theairlab.org/tartanair-dataset/). 
+**Frame budget:** processed frames = `min(max_frames, frames_in(start..end) after fps resample)`. The model uses a sliding window so longer is fine; only memory limits you.
 
+### Query points (what to track)
 
-### Stage 1
+| Input | Type | Default | Notes |
+|---|---|---|---|
+| `query_mode` | enum | `grid` | `grid` / `points` / `mask` / `dense` |
+| `query_frame` | int | 0 | Seed frame index (negative = from end). |
+| `grid_size` | int | 30 | NxN grid (modes: `grid`, `mask`). Up to 120 → 14,400 points. |
+| `grid_region` | str | "" | Optional `"x1,y1,x2,y2"` in original-video pixels to confine the grid. |
+| `query_points` | str | "" | JSON `[[x,y], …]` in original video pixel coords. Mode: `points`. |
+| `query_mask` | File | None | Binary PNG mask (white = track here). Mode: `mask`. |
+| `dense_stride` | int | 4 | Pixel stride for dense mode. 1 = every pixel of model-res. Mode: `dense`. |
 
-Stage 1 is to train the model for 200k steps on Kubric. 
+**Density cheat sheet** (at `resize_to=768`, so model-res ~768×432):
 
-```
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7; python train_stage1.py  --mixed_precision --lr 5e-4 --max_steps 200000 --data_dir /data --exp "stage1abc" 
-```
+| Mode | Setting | Points |
+|---|---|---|
+| grid | `grid_size=30` | 900 |
+| grid | `grid_size=60` | 3,600 |
+| grid | `grid_size=120` | 14,400 |
+| dense | `dense_stride=4` | ~21k |
+| dense | `dense_stride=2` | ~83k |
+| dense | `dense_stride=1` | ~330k (heavy; export NPZ only) |
+| dense | `dense_stride=1, resize_to=0` (1080p) | **~2.07M** — every native pixel |
 
-This should produce a tensorboard log in `./logs_train/`, and checkpoints in `./checkpoints/`, in folder names similar to "64Ai4i3_5e-4m_stage1abc_1318". (The 4-digit string at the end is a timecode indicating when the run began, to help make the filepaths unique.)
+> **"Pixel-level" tracking** = `query_mode=dense, dense_stride=1`. The lattice resolution is `resize_to × (resize_to × aspect)` rounded to multiples of 8. At `resize_to=0` (native) on a 1920×1080 input that's every native pixel.
 
-### Stage 2
+### Tracking
 
-Stage 2 is to train the model for 400k steps on a mix of point tracking datasets and optical flow datasets. This stage initializes from the output of Stage 1.
+| Input | Type | Default | Notes |
+|---|---|---|---|
+| `track_direction` | enum | `bidirectional` | `forward` / `backward` / `bidirectional` (needs `query_frame > 0`). |
+| `inference_iters` | int | 4 | Refinement iterations per window. More = better/slower (1–8). |
+| `visibility_threshold` | float | 0.1 | Hide track segments with confidence below this. 0..1. |
 
-```
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7; python train_stage2.py  --mixed_precision --init_dir '64Ai4i3_5e-4m_stage1abc_1318' --lr 1e-5 --max_steps 400000 --exp 'stage2abc'
-```
+### Output
 
-## Evaluation
+| Input | Type | Default | Notes |
+|---|---|---|---|
+| `output_format` | enum | `all` | `mp4_overlay` / `mp4_sidebyside` / `mp4_flow` / `trajectories_json` / `trajectories_npz` / `flow_npz` / `all` |
+| `overlay_style` | enum | `trails` | `dots` (GPU, fast) / `trails` / `arrows` / `heatmap` |
+| `trail_length` | int | 16 | Frames of history drawn behind each point (`trails` style). |
+| `point_size` | int | 2 | Dot radius in pixels (1–12). |
+| `color_scheme` | enum | `rainbow` | `rainbow` / `motion_direction` / `cluster` / `single` |
+| `single_color` | str | `#FF5050` | Hex color for `color_scheme=single`. |
+| `cluster_k` | int | 8 | K for `color_scheme=cluster`. |
+| `background` | enum | `video` | `video` (50% dim) / `dim` (75% dim) / `black` / `white` |
+| `output_fps` | int | 0 | 0 = same as input (after resample). |
+| `output_codec` | enum | `h264` | `h264` / `h265` / `vp9` / `prores` |
+| `seed` | int | 0 | Random seed (affects cluster init). |
 
-Test the model on point tracking datasets with a command like:
+---
 
-```
-python test_dense_on_sparse.py --dname 'dav'
-```
+## Outputs
 
-At the end, you should see:
-```
-da: 76.3,
-aj: 63.3,
-oa: 90.0,
-```
-which represent `d_avg` (accuracy), Average Jaccard, and Occlusion Accuracy. We find that small numerical issues (even across GPUs) may cause +- 0.1 fluctuation on these metrics. 
+Cog returns a dict. With `output_format=all` you get all six artifacts:
 
-Test it at higher resolution with the `image_size` arg, like: `--image_size 448 768`, which should produce `da: 78.8, aj: 65.9, oa: 90.2` or `--image_size 768 1024`, which should produce `da: 80.6, aj: 67.2, oa: 89.7`.
-
-Note that AJ and OA are not reliable metrics in all datasets, because not all datasets follow the same rules about visibility annotation.
-
-Dataloaders for all test datasets are in the repo, and can be run in sequence with a command like:
-```
-python test_dense_on_sparse.py --dname 'bad,cro,dav,dri,ego,hor,kin,rgb,rob'
-```
-but if you have multiple GPUs, we recomend running the tests in parallel.
-
-
-## Citation
-
-If you use this code for your research, please cite:
-
-```
-Adam W. Harley, Yang You, Xinglong Sun, Yang Zheng, Nikhil Raghuraman, Yunqi Gu, Sheldon Liang, Wen-Hsuan Chu, Achal Dave, Pavel Tokmakov, Suya You, Rares Ambrus, Katerina Fragkiadaki, Leonidas J. Guibas. AllTracker: Efficient Dense Point Tracking at High Resolution. ICCV 2025.
-```
-
-Bibtex:
-```
-@inproceedings{harley2025alltracker,
-author    = {Adam W. Harley and Yang You and Xinglong Sun and Yang Zheng and Nikhil Raghuraman and Yunqi Gu and Sheldon Liang and Wen-Hsuan Chu and Achal Dave and Pavel Tokmakov and Suya You and Rares Ambrus and Katerina Fragkiadaki and Leonidas J. Guibas},
-title     = {All{T}racker: {E}fficient Dense Point Tracking at High Resolution}
-booktitle = {ICCV},
-year      = {2025}
+```json
+{
+  "video":            "https://replicate.delivery/.../overlay.mp4",
+  "flow_video":       "https://replicate.delivery/.../flow.mp4",
+  "trajectories":     "https://replicate.delivery/.../trajectories.json",
+  "trajectories_npz": "https://replicate.delivery/.../trajectories.npz",
+  "flow_npz":         "https://replicate.delivery/.../flow.npz",
+  "preview_frame":    "https://replicate.delivery/.../preview.png",
+  "stats": {
+    "num_points": 14400,
+    "frames_processed": 192,
+    "mean_visibility": 0.97,
+    "runtime_seconds": 9.0,
+    "forward_seconds": 6.1,
+    "model_resolution": [432, 768],
+    "source_fps": 24.0,
+    "effective_fps": 24.0,
+    "query_frame": 0
+  }
 }
 ```
+
+`trajectories.json` schema:
+
+```json
+{
+  "frames": 192,
+  "points": 14400,
+  "fps": 24.0,
+  "query_frame": 0,
+  "query_points": [[x, y], ...],        // original-pixel coords, length N
+  "tracks":      [[[x, y], ...], ...],  // shape T × N × 2, original-pixel coords
+  "visibility":  [[v, ...], ...]        // shape T × N, 0..1
+}
+```
+
+`trajectories.npz` contains the same arrays as float32 (much smaller than JSON for dense outputs).
+
+`flow.npz` schema (the raw dense per-pixel flow field — independent of `query_mode` / `dense_stride`):
+
+```python
+import numpy as np
+d = np.load("flow.npz")
+d["flow"]              # (T, 2, H, W) float32 — per-pixel displacement (Δx, Δy) from query frame, in original-video pixels
+d["visibility"]        # (T, H, W)    float32 — per-pixel visibility/confidence 0..1
+d["model_resolution"]  # [H, W]       int32   — lattice resolution (resize_to-driven)
+d["query_frame"]       # scalar int
+d["fps"]               # scalar float
+```
+
+`flow.mp4` is the same flow field rendered as an HSV-encoded video (hue = direction, value = magnitude clipped per-clip), one frame per processed input frame.
+
+---
+
+## Recipes
+
+### Maximum density (visualization only)
+
+```python
+{
+    "query_mode": "dense", "dense_stride": 2,
+    "resize_to": 768,
+    "overlay_style": "dots", "point_size": 1, "background": "dim",
+    "output_format": "mp4_overlay",   # skip JSON — N×T can be enormous
+}
+```
+
+### True pixel-level tracking (every native pixel)
+
+```python
+{
+    "resize_to": 0,                   # native; on 1080p input that's 1920x1080
+    "query_mode": "dense", "dense_stride": 1,
+    "output_format": "trajectories_npz",   # JSON would be many GB
+    "overlay_style": "dots", "point_size": 1, "background": "dim",
+}
+```
+
+Decode the dense field locally:
+
+```python
+import numpy as np
+d = np.load("trajectories.npz")
+T = d["tracks"].shape[0]
+H, W = d["query_points"][:, 1].max() + 1, d["query_points"][:, 0].max() + 1  # or read from stats.model_resolution
+tracks = d["tracks"].reshape(T, int(H), int(W), 2)        # destination (x,y) per pixel
+flow   = tracks - d["query_points"].reshape(int(H), int(W), 2)[None]  # displacement per pixel
+vis    = d["visibility"].reshape(T, int(H), int(W))
+```
+
+### Sparse grid with trajectories for downstream use
+
+```python
+{
+    "query_mode": "grid", "grid_size": 40,
+    "resize_to": 512,
+    "overlay_style": "trails", "trail_length": 20,
+    "output_format": "trajectories_npz",
+}
+```
+
+### Track a single object (clicked points)
+
+```python
+{
+    "query_mode": "points",
+    "query_points": "[[820, 540], [890, 600], [780, 720]]",
+    "query_frame": 0,
+    "overlay_style": "trails", "trail_length": 32,
+    "color_scheme": "single", "single_color": "#00FFAA",
+    "background": "video",
+}
+```
+
+### Track only a region of interest
+
+```python
+{
+    "query_mode": "grid", "grid_size": 50,
+    "grid_region": "640,360,1280,720",      # x1,y1,x2,y2 in original pixels
+    "overlay_style": "dots",
+}
+```
+
+### Track inside a mask
+
+```python
+{
+    "query_mode": "mask",
+    "query_mask": open("foreground_mask.png", "rb"),
+    "grid_size": 40,
+}
+```
+
+### Dense per-pixel optical flow (visualization)
+
+```python
+{
+    "resize_to": 768,
+    "output_format": "mp4_flow",      # HSV optical-flow video
+}
+```
+
+### Raw flow tensor for downstream processing
+
+```python
+{
+    "resize_to": 1024,
+    "output_format": "flow_npz",      # (T,2,H,W) displacement field + visibility
+}
+```
+
+Both `mp4_flow` and `flow_npz` work regardless of `query_mode` — they come from the model's dense output directly, not the sampled query points.
+
+### Side-by-side comparison
+
+```python
+{
+    "output_format": "mp4_sidebyside",   # input | overlay
+    "overlay_style": "trails",
+    "background": "black",
+}
+```
+
+### Track backward from end of clip
+
+```python
+{
+    "query_frame": -1,                # last frame
+    "track_direction": "backward",
+}
+```
+
+### Bidirectional from a chosen middle frame
+
+```python
+{
+    "query_frame": 64,
+    "track_direction": "bidirectional",
+}
+```
+
+---
+
+## Performance
+
+A100-80GB timings observed on the 8-second 1080p test clip (L40S timings shown in parens — model was originally deployed there):
+
+| Resolution | Frames | Points (dense_stride=2) | Forward (s) | Total (warm, s) |
+|---|---|---|---|---|
+| 512 | 128 | ~37k | ~1.5 | ~5 |
+| 768 | 128 | ~83k | ~4.4 | ~7 |
+| 768 | 192 | ~83k | ~6.1 | ~9 |
+| 1024 | 128 | ~147k | ~10 | ~15 |
+| 1920 (native) | 192 | ~518k (stride=2) | ~30–40 | ~50 |
+
+Cold start (container boot + weights load): **~60–95s** on the first request after idle. After warm, each prediction reuses the loaded model.
+
+**Memory:** dominant cost is the dense flow field, `B × T × 2 × H × W × 4 bytes`. At 192 frames × 768×432 that's ~250 MB. On A100-80GB you can comfortably push to native 1920×1080 or longer clips.
+
+---
+
+## Notes & gotchas
+
+- **JSON output at dense settings is large.** 83k points × 192 frames × 2 floats × ~15 chars = ~480 MB JSON. Prefer NPZ (~50× smaller). For visualization-only runs set `output_format=mp4_overlay`.
+- **`dots` is the fast path.** Rendered on GPU via scatter-add (ported from the demo). `trails`, `arrows`, and `heatmap` run on CPU; at >20k points these slow the render step significantly.
+- **Coordinates in outputs are in original-video pixel space.** Internal model coords (resized) are not exposed.
+- **`bidirectional` with `query_frame=0` just runs forward** — there's nothing behind frame 0 to track.
+- **The `mp4_overlay` background colors are pre-baked into the video.** Re-render if you change your mind.
+- **GIF inputs:** treated as videos; framerate detected from the file.
+
+---
+
+## Iterating on the model
+
+The Cog project lives at `~/Desktop/alltracker-cog/`. To ship a new version:
+
+```bash
+cd ~/Desktop/alltracker-cog
+# edit predict.py / cog.yaml
+REPLICATE_API_TOKEN=r8_… cog push r8.im/jerryjalapeno/alltracker
+```
+
+Cached layers make rebuilds ~30s when only `predict.py` changes. The model weights are baked into the image at build time (`cog.yaml: build.run`), so cold starts don't re-download them.
