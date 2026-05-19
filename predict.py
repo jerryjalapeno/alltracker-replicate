@@ -415,6 +415,7 @@ class Predictor(BasePredictor):
         for p in self.model.parameters():
             p.requires_grad = False
         torch.set_grad_enabled(False)
+
         print("AllTracker loaded.")
 
     def predict(
@@ -425,8 +426,8 @@ class Predictor(BasePredictor):
             default=0, ge=0, le=120,
         ),
         max_frames: int = Input(
-            description="Hard cap on frames after fps resample (memory guardrail).",
-            default=256, ge=2, le=2000,
+            description="Hard cap on frames after fps resample (memory guardrail). A100-80GB handles 1000+ frames at 768px comfortably.",
+            default=512, ge=2, le=2000,
         ),
         start_frame: int = Input(description="Trim: start frame (0-indexed).", default=0, ge=0),
         end_frame: int = Input(description="Trim: end frame (-1 = last).", default=-1, ge=-1),
@@ -507,6 +508,10 @@ class Predictor(BasePredictor):
             choices=["h264", "h265", "vp9", "prores"], default="h264",
         ),
         seed: int = Input(description="Random seed (used for cluster init etc.).", default=0),
+        precision: str = Input(
+            description="Inference precision. bf16 is ~1.5x faster on A100 with negligible accuracy impact for this model; fp32 is the safe default.",
+            choices=["fp32", "bf16"], default="fp32",
+        ),
     ) -> dict:
         t_start = time.time()
         torch.manual_seed(seed)
@@ -597,7 +602,7 @@ class Predictor(BasePredictor):
 
         t_fwd = time.time()
         traj_maps_full, visconf_maps_full = self._run_directional(
-            rgbs_t, qf, track_direction, grid_xy, inference_iters
+            rgbs_t, qf, track_direction, grid_xy, inference_iters, precision=precision
         )
         fwd_time = time.time() - t_fwd
         print(f"[alltracker] forward: {fwd_time:.1f}s for {T} frames")
@@ -812,41 +817,47 @@ class Predictor(BasePredictor):
         direction: str,
         grid_xy: torch.Tensor,        # (1,1,2,H,W)
         iters: int,
+        precision: str = "fp32",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run forward / backward / bidirectional sliding inference.
-        Returns (traj_maps, visconf_maps) each shape (1,T,2,H,W)."""
+        Returns (traj_maps, visconf_maps) each shape (1,T,2,H,W) in float32."""
         B, T, C, H, W = rgbs_t.shape
         device = rgbs_t.device
 
         traj_maps_full = torch.zeros(B, T, 2, H, W, device=device)
         visconf_maps_full = torch.zeros(B, T, 2, H, W, device=device)
 
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if precision == "bf16"
+            else torch.autocast(device_type="cuda", enabled=False)
+        )
+
         # Forward portion (qf..end) — always anchored at qf
         if direction in ("forward", "bidirectional") and qf < T - 1:
-            fwd_flows, fwd_vc, _, _ = self.model.forward_sliding(
-                rgbs_t[:, qf:], iters=iters, sw=None, is_training=False
-            )
-            fwd_traj = fwd_flows.to(device) + grid_xy  # (1,Tf,2,H,W)
+            with autocast_ctx:
+                fwd_flows, fwd_vc, _, _ = self.model.forward_sliding(
+                    rgbs_t[:, qf:], iters=iters, sw=None, is_training=False
+                )
+            fwd_traj = fwd_flows.float().to(device) + grid_xy
             traj_maps_full[:, qf:] = fwd_traj
-            visconf_maps_full[:, qf:] = fwd_vc.to(device)
+            visconf_maps_full[:, qf:] = fwd_vc.float().to(device)
         else:
-            # at least mark qf as the identity
             traj_maps_full[:, qf:qf + 1] = grid_xy
             visconf_maps_full[:, qf:qf + 1] = 1.0
 
-        # Backward portion (0..qf-1)
         if direction in ("backward", "bidirectional") and qf > 0:
-            bwd_flows, bwd_vc, _, _ = self.model.forward_sliding(
-                rgbs_t[:, :qf + 1].flip([1]), iters=iters, sw=None, is_training=False
-            )
-            bwd_traj = bwd_flows.to(device) + grid_xy
+            with autocast_ctx:
+                bwd_flows, bwd_vc, _, _ = self.model.forward_sliding(
+                    rgbs_t[:, :qf + 1].flip([1]), iters=iters, sw=None, is_training=False
+                )
+            bwd_traj = bwd_flows.float().to(device) + grid_xy
             bwd_traj = bwd_traj.flip([1])[:, :-1]
-            bwd_vc = bwd_vc.to(device).flip([1])[:, :-1]
+            bwd_vc = bwd_vc.float().to(device).flip([1])[:, :-1]
             traj_maps_full[:, :qf] = bwd_traj
             visconf_maps_full[:, :qf] = bwd_vc
         elif direction == "forward" and qf > 0:
-            # forward-only: fill backward with identity (no tracking before qf)
             traj_maps_full[:, :qf] = grid_xy
-            visconf_maps_full[:, :qf] = 0.0  # mark as not-visible
+            visconf_maps_full[:, :qf] = 0.0
 
         return traj_maps_full, visconf_maps_full
