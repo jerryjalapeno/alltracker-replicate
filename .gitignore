@@ -9,3 +9,8 @@ stock_videos/
 logs*
 *.mp4
 temp_*
+.cog/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
