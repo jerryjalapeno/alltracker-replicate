@@ -6,7 +6,15 @@ A flexible [Cog](https://github.com/replicate/cog) wrapper around [AllTracker](h
 
 **Model:** https://replicate.com/jerryjalapeno/alltracker
 **Hardware:** Nvidia A100 80 GB
-**Inference cost on the zombie test clip (8s, 1080p, 192 frames):** ~6s GPU time at 768px / 83k points.
+**Latest version:** `d3ff6822fad6f2597d5a39e88f63bd8841490ec937b8dfae7b59a2c8ac4882a6`
+**Inference cost on the zombie test clip (8s, 1080p, 192 frames):** ~6s GPU time at 768px / 83k points; ~3s of overlapped output writes.
+
+### What's in the box
+
+- Four **query modes**: `grid`, user-specified `points`, mask ROI, and `dense` (every Nth pixel of the model-resolution flow field).
+- Three **tracking directions**: forward, backward, bidirectional (anchored at any `query_frame`).
+- Six **output artifacts** (per request): overlay MP4, side-by-side MP4, HSV-encoded flow MP4, raw dense flow NPZ `(T,2,H,W)`, sparse trajectories JSON/NPZ, preview frame, and a stats dict.
+- GPU-vectorized dot renderer handles 100k+ points without slowdown; parallel disk writers overlap JSON/NPZ/MP4 encoding.
 
 ---
 
@@ -47,7 +55,7 @@ curl -s -X POST https://api.replicate.com/v1/predictions \
   -H "Authorization: Bearer $REPLICATE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "version": "63bead4682f97e370f62c14726456959bb8f193ab0b9dddeb3875ca6ad139c6e",
+    "version": "d3ff6822fad6f2597d5a39e88f63bd8841490ec937b8dfae7b59a2c8ac4882a6",
     "input": {
       "video": "https://example.com/clip.mp4",
       "query_mode": "grid",
@@ -316,7 +324,7 @@ Both `mp4_flow` and `flow_npz` work regardless of `query_mode` — they come fro
 
 ## Performance
 
-A100-80GB timings observed on the 8-second 1080p test clip (L40S timings shown in parens — model was originally deployed there):
+Approximate timings on the 8-second 1080p test clip. The numbers below were measured on L40S; A100-80GB delivers similar forward throughput for this FP32 workload but unlocks much larger memory headroom (long clips, native 1080p, `dense_stride=1`):
 
 | Resolution | Frames | Points (dense_stride=2) | Forward (s) | Total (warm, s) |
 |---|---|---|---|---|
